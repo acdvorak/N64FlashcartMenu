@@ -40,6 +40,16 @@ Idle RESET returns to the stock menu. SM64 EEPROM settings persist after immedia
 
 Local synthetic tests passed EEPROM (4/16 Kbit) and SRAM (32/96 KiB) persistence under orderly MCU-stop power cycles. The 128 KiB SRAM, FlashRAM, and PKST2 fixtures had mismatches confined to the final four bytes. Retail SRAM/FlashRAM save-and-reload, emulator saves, and uncontrolled power-loss timing still need qualification.
 
+### Cartridge button
+
+`get_button_state` reads `SYSSTAT_BTN` (bit 16) through the existing serialized register access. Settings > Flashcart reports Button as Supported; press Z there to see the live Pressed/Released state. Polling does not send MCU commands or access storage.
+
+Firmware 26.1014 stops reporting the button after `DEV_STOP`. Before mounting FatFs, initialization applies a complete all-OFF device configuration, starts idle polling, and checks `HAN_STAT` to confirm the save, RTC, DD, and cache fields are inactive. Storage release stops this idle configuration after unmounting, before MCU filesystem initialization and the normal game configuration.
+
+Build the physical test with `TEST_FLAGS=-DED64_PRO_TEST_BUTTON` in `tests/ed64_pro/Makefile.n64`. It requires a released baseline and three complete press/release cycles, then keeps displaying the live state and counts.
+
+On firmware 26.1014 with an NTSC N64 and Expansion Pak, the normal menu reported Released/Pressed/Released correctly. SD fixture reads, dedicated scratch-file writes and release, and a normal SM64 game launch also passed with idle polling enabled.
+
 ### Real-time clock
 
 The Pro backend initializes libdragon time after mounting storage, then installs its clock hooks. The unchanged menu's later `rtc_init()` is idempotent. The menu, `time()`, `gettimeofday()`, and file timestamps use the Pro clock; ordinary reads advance a validated cache without MCU traffic.

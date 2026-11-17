@@ -438,7 +438,7 @@ static ed64_pro_ll_error_t pro_send_frame (
         ((command == PRO_CMD_STOP || command == PRO_CMD_SD_INIT || command == PRO_CMD_SYS) && subcommand == 0x10) ||
         ((command == PRO_CMD_EPO || command == PRO_CMD_RTC) && (subcommand == 0x10 || subcommand == 0x11)) ||
         (command == PRO_CMD_DEV &&
-         (subcommand == 0x11 || subcommand == 0x20 || subcommand == 0x21 || subcommand == 0x28));
+         (subcommand == 0x11 || subcommand == 0x20 || subcommand == 0x21 || subcommand == 0x27 || subcommand == 0x28));
     if (!selected) {
         return ED64_PRO_LL_ARGUMENT;
     }
@@ -1142,4 +1142,45 @@ ed64_pro_ll_dev_set_cfg (ed64_pro_ll_transaction_t *transaction, const ed64_pro_
  */
 ed64_pro_ll_error_t ed64_pro_ll_dev_start (ed64_pro_ll_transaction_t *transaction, uint32_t deadline) {
     return pro_dev_command(transaction, 0x11, NULL, 0, deadline);
+}
+
+/**
+ * @brief Enable button reporting with all game services disabled, then verify their inactivity.
+ *
+ * STOP disables button reporting on tested Pro firmware. A complete zeroed
+ * configuration avoids inheriting game paths' save, RTC, or DD handlers. Call
+ * only before FatFs mounts; reserved handler-status bytes are not interpreted.
+ */
+ed64_pro_ll_error_t ed64_pro_ll_start_idle (ed64_pro_ll_transaction_t *transaction, uint32_t deadline) {
+    const uint8_t config[sizeof(ed64_pro_dev_cfg_t)] = {0};
+    ed64_pro_ll_error_t error = pro_dev_command(transaction, 0x20, config, sizeof(config), deadline);
+    if (error == ED64_PRO_LL_OK) {
+        error = ed64_pro_ll_dev_start(transaction, deadline);
+    }
+    if (error != ED64_PRO_LL_OK) {
+        return error;
+    }
+    deadline = ed64_pro_ll_limit_deadline(pro_deadline(transaction, deadline), ED64_PRO_IO_TIMEOUT_MS);
+    pro_ll.status_valid = false;
+    pro_ll.nresp_valid = false;
+    error = pro_assert_idle(transaction, deadline);
+    if (error == ED64_PRO_LL_OK) {
+        error = pro_send_frame(transaction, PRO_CMD_DEV, 0x27, NULL, 0, deadline);
+    }
+    uint8_t handlers[16];
+    if (error == ED64_PRO_LL_OK) {
+        error = pro_fifo_read(transaction, handlers, sizeof(handlers), deadline);
+    }
+    if (error == ED64_PRO_LL_OK) {
+        error = pro_assert_idle(transaction, deadline);
+    }
+    if (error != ED64_PRO_LL_OK) {
+        return error;
+    }
+    for (size_t i = 0; i < 6; i++) {
+        if (handlers[i] != 0) {
+            return pro_fail(ED64_PRO_LL_FRAME);
+        }
+    }
+    return ED64_PRO_LL_OK;
 }

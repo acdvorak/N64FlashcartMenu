@@ -206,6 +206,10 @@ static struct {
     char launch_paths[2][ED64_PRO_PATH_MAX + 1];
     uint32_t info[2];
     unsigned info_calls;
+    unsigned idle_calls;
+    unsigned stop_calls;
+    unsigned drain_calls;
+    unsigned status_calls;
     unsigned begin_calls;
     unsigned end_calls;
     unsigned reads;
@@ -217,6 +221,10 @@ static struct {
     ed64_pro_ll_error_t io_error;
     ed64_pro_ll_error_t begin_error;
     ed64_pro_ll_error_t info_error;
+    ed64_pro_ll_error_t idle_error;
+    ed64_pro_ll_error_t stop_error;
+    ed64_pro_ll_error_t drain_error;
+    ed64_pro_ll_error_t status_error;
     ed64_pro_ll_error_t init_error;
     ed64_pro_ll_failure_t failure;
     int mount_result;
@@ -282,13 +290,28 @@ ed64_pro_ll_error_t ed64_pro_ll_end (ed64_pro_ll_transaction_t *transaction) {
 }
 
 /**
+ * @brief Fail if unrelated adapter tests unexpectedly query cartridge registers.
+ */
+ed64_pro_ll_error_t
+ed64_pro_ll_read_reg (ed64_pro_ll_transaction_t *transaction, ed64_pro_reg_t reg, uint32_t *value, uint32_t deadline) {
+    (void)transaction;
+    (void)reg;
+    (void)value;
+    (void)deadline;
+    TEST_CHECK(false);
+    return ED64_PRO_LL_ARGUMENT;
+}
+
+/**
  * @brief Simulate an empty receive FIFO.
  */
 ed64_pro_ll_error_t ed64_pro_ll_drain (ed64_pro_ll_transaction_t *transaction, size_t *drained, uint32_t deadline) {
     (void)transaction;
     (void)deadline;
+    mock.drain_calls++;
+    mock.events[mock.events_count++] = 'D';
     *drained = 0;
-    return ED64_PRO_LL_OK;
+    return mock.drain_error;
 }
 
 /**
@@ -307,16 +330,32 @@ ed64_pro_ll_read_status (ed64_pro_ll_transaction_t *transaction, ed64_pro_status
  */
 ed64_pro_ll_error_t
 ed64_pro_ll_check_status (ed64_pro_ll_transaction_t *transaction, ed64_pro_status_t *status, uint32_t deadline) {
-    return ed64_pro_ll_read_status(transaction, status, deadline);
+    mock.status_calls++;
+    mock.events[mock.events_count++] = 'H';
+    ed64_pro_ll_read_status(transaction, status, deadline);
+    return mock.status_error;
 }
 
 /**
- * @brief Simulate a successful stop command.
+ * @brief Record service shutdown and return its configured result.
  */
 ed64_pro_ll_error_t ed64_pro_ll_stop (ed64_pro_ll_transaction_t *transaction, uint32_t deadline) {
     (void)transaction;
     (void)deadline;
-    return ED64_PRO_LL_OK;
+    mock.stop_calls++;
+    mock.events[mock.events_count++] = 'T';
+    return mock.stop_error;
+}
+
+/**
+ * @brief Start idle button sampling only after validated firmware information and before mounting.
+ */
+ed64_pro_ll_error_t ed64_pro_ll_start_idle (ed64_pro_ll_transaction_t *transaction, uint32_t deadline) {
+    (void)transaction;
+    (void)deadline;
+    TEST_CHECK(mock.info_calls == 1 && mock.info_error == ED64_PRO_LL_OK && mock.mounts == 0);
+    mock.idle_calls++;
+    return mock.idle_error;
 }
 
 /**
@@ -658,7 +697,7 @@ static void test_firmware_info (void) {
     TEST_CHECK(pro_get_firmware_version().revision == 0);
     TEST_CHECK(pro_diagnostics.rom_capacity == 0x0F000000u);
     TEST_CHECK(strcmp(pro_get_name(), "EverDrive-64 Pro") == 0);
-    TEST_CHECK(pro_init() == FLASHCART_OK && mock.info_calls == 1);
+    TEST_CHECK(pro_init() == FLASHCART_OK && mock.info_calls == 1 && mock.idle_calls == 1);
 }
 
 /**
@@ -686,11 +725,12 @@ static void test_firmware_boundaries (void) {
         mock.info[0] = fat_date(cases[i].year, cases[i].month, cases[i].day);
         TEST_CHECK(pro_init() == cases[i].result);
         TEST_CHECK(mock.info_calls == 1);
+        TEST_CHECK(mock.idle_calls == (cases[i].result == FLASHCART_OK ? 1u : 0u));
         TEST_CHECK((pro_get_error_message(cases[i].result) == NULL) == (cases[i].result == FLASHCART_OK));
     }
     fixture();
     mock.info[1] = 0;
-    TEST_CHECK(pro_init() == FLASHCART_ERR_INT);
+    TEST_CHECK(pro_init() == FLASHCART_ERR_INT && mock.idle_calls == 0);
 }
 
 /**
@@ -702,7 +742,23 @@ static void test_firmware_query_failure (void) {
     TEST_CHECK(pro_init() == FLASHCART_ERR_INT);
     TEST_CHECK(pro_diagnostics.phase == ED64_PRO_PHASE_FIRMWARE_INFO);
     TEST_CHECK(strstr(ed64_pro_get_error_message(), "Firmware info") != NULL);
-    TEST_CHECK(pro_init() == FLASHCART_ERR_INT && mock.info_calls == 1);
+    TEST_CHECK(pro_init() == FLASHCART_ERR_INT && mock.info_calls == 1 && mock.idle_calls == 0);
+}
+
+/**
+ * @brief Refuse mounting and retries when idle button-service startup fails.
+ */
+static void test_idle_startup_failure (void) {
+    fixture();
+    mock.idle_error = ED64_PRO_LL_MCU_ERROR;
+    TEST_CHECK(pro_init() == FLASHCART_ERR_INT);
+    TEST_CHECK(mock.idle_calls == 1 && mock.info_calls == 1 && mock.mounts == 0);
+    TEST_CHECK(pro_diagnostics.state == ED64_PRO_FAILED && pro_diagnostics.failure.code == ED64_PRO_LL_MCU_ERROR);
+    TEST_CHECK(mock.end_calls == mock.begin_calls);
+    unsigned begins = mock.begin_calls;
+    TEST_CHECK(!ed64_pro_init_sdfs("sd:/", 4) && mock.mounts == 0);
+    TEST_CHECK(pro_init() == FLASHCART_ERR_INT);
+    TEST_CHECK(mock.idle_calls == 1 && mock.info_calls == 1 && mock.begin_calls == begins);
 }
 
 /**
@@ -710,7 +766,7 @@ static void test_firmware_query_failure (void) {
  */
 static void test_mount (void) {
     mounted_fixture();
-    TEST_CHECK(mock.mounts == 1 && mock.disk == &pro_disk);
+    TEST_CHECK(mock.mounts == 1 && mock.disk == &pro_disk && mock.idle_calls == 1);
     TEST_CHECK(pro_diagnostics.storage_state == ED64_PRO_STORAGE_FATFS_OWNED);
     TEST_CHECK(!ed64_pro_init_sdfs("sd:/", 4) && mock.mounts == 1);
     TEST_CHECK(pro_disk.disk_status() == 0);
@@ -861,7 +917,8 @@ static void test_release (void) {
     mounted_fixture();
     TEST_CHECK(pro_release_storage() == FLASHCART_OK);
     TEST_CHECK(mock.unmounts == 1 && mock.fs_inits == 1);
-    TEST_CHECK(mock.events[0] == 'U' && mock.events[1] == 'F');
+    TEST_CHECK(strcmp(mock.events, "UTDHF") == 0);
+    TEST_CHECK(mock.stop_calls == 1 && mock.drain_calls == 1 && mock.status_calls == 1);
     TEST_CHECK(pro_diagnostics.storage_state == ED64_PRO_STORAGE_MCU_OWNED);
     TEST_CHECK(pro_disk.disk_status() == STA_NOINIT);
 }
@@ -874,20 +931,49 @@ static void test_release_refusals (void) {
     uint8_t data[512] = {0};
     TEST_CHECK(pro_disk.disk_write(data, 2, 1) == RES_OK);
     TEST_CHECK(pro_release_storage() == FLASHCART_ERR_SD_CARD);
-    TEST_CHECK(mock.unmounts == 0 && mock.fs_inits == 0);
+    TEST_CHECK(mock.unmounts == 0 && mock.fs_inits == 0 && mock.stop_calls == 0);
     TEST_CHECK(strstr(ed64_pro_get_error_message(), "unclosed write") != NULL);
 
     mounted_fixture();
     mock.unmount_result = -1;
     TEST_CHECK(pro_release_storage() == FLASHCART_ERR_SD_CARD);
-    TEST_CHECK(mock.unmounts == 1 && mock.fs_inits == 0);
-    TEST_CHECK(pro_release_storage() == FLASHCART_ERR_SD_CARD && mock.unmounts == 1);
+    TEST_CHECK(mock.unmounts == 1 && mock.fs_inits == 0 && mock.stop_calls == 0);
+    TEST_CHECK(pro_release_storage() == FLASHCART_ERR_SD_CARD && mock.unmounts == 1 && mock.stop_calls == 0);
 
     mounted_fixture();
     mock.init_error = ED64_PRO_LL_MCU_ERROR;
     TEST_CHECK(pro_release_storage() == FLASHCART_ERR_INT);
     TEST_CHECK(mock.unmounts == 1 && mock.fs_inits == 1);
     TEST_CHECK(pro_release_storage() == FLASHCART_ERR_SD_CARD && mock.fs_inits == 1);
+}
+
+/**
+ * @brief Stop each failed release phase before MCU filesystem reuse and never retry it.
+ */
+static void test_release_idle_stop_faults (void) {
+    static const char *events[] = {"UT", "UTD", "UTDH"};
+    for (unsigned failure = 0; failure < 3; failure++) {
+        mounted_fixture();
+        if (failure == 0) {
+            mock.stop_error = ED64_PRO_LL_TIMEOUT;
+        } else if (failure == 1) {
+            mock.drain_error = ED64_PRO_LL_DRAIN_LIMIT;
+        } else {
+            mock.status_error = ED64_PRO_LL_MCU_ERROR;
+        }
+        unsigned ends = mock.end_calls;
+        TEST_CHECK(pro_release_storage() == FLASHCART_ERR_INT);
+        TEST_CHECK(mock.unmounts == 1 && mock.fs_inits == 0);
+        TEST_CHECK(strcmp(mock.events, events[failure]) == 0);
+        TEST_CHECK(mock.stop_calls == 1 && mock.drain_calls == (failure >= 1 ? 1u : 0u));
+        TEST_CHECK(mock.status_calls == (failure == 2 ? 1u : 0u));
+        TEST_CHECK(pro_diagnostics.storage_failed && pro_disk.disk_status() == STA_NOINIT);
+        TEST_CHECK(mock.begin_calls == 1 && mock.end_calls == ends + 1);
+        unsigned begins = mock.begin_calls;
+        TEST_CHECK(pro_release_storage() == FLASHCART_ERR_SD_CARD);
+        TEST_CHECK(mock.begin_calls == begins && mock.unmounts == 1 && mock.fs_inits == 0);
+        TEST_CHECK(strcmp(mock.events, events[failure]) == 0);
+    }
 }
 
 /**
@@ -1056,7 +1142,7 @@ static void test_game_handoff (void) {
         TEST_CHECK(pro_deinit() == FLASHCART_OK);
         TEST_CHECK(mock.unmounts == 1 && mock.fs_inits == 1);
         TEST_CHECK(mock.command_calls == (save ? 4u : 3u));
-        TEST_CHECK(strcmp(mock.events, save ? "UFPBGS" : "UFPGS") == 0);
+        TEST_CHECK(strcmp(mock.events, save ? "UTDHFPBGS" : "UTDHFPGS") == 0);
         TEST_CHECK(strcmp(mock.launch_paths[0], "/game.z64") == 0);
         TEST_CHECK(strcmp(mock.launch_paths[1], save ? "/saves/game.sav" : "") == 0);
         TEST_CHECK(mock.config.brom_type == ED64_PRO_ROM_GPAK && mock.config.gpak_size == 1024);
@@ -1076,7 +1162,7 @@ static void test_game_handoff_callback (void) {
     staged_game_fixture(false);
     handoff_halt_calls = 0;
     TEST_CHECK(ed64_pro_get_flashcart()->deinit() == FLASHCART_OK);
-    TEST_CHECK(handoff_halt_calls == 0 && strcmp(mock.events, "UFPGS") == 0);
+    TEST_CHECK(handoff_halt_calls == 0 && strcmp(mock.events, "UTDHFPGS") == 0);
 
     for (unsigned failure = 0; failure < 2; failure++) {
         staged_game_fixture(true);
@@ -1359,6 +1445,7 @@ TEST_LIST = {
     {"cached firmware identity and capacity", test_firmware_info},
     {"firmware date and minimum boundaries", test_firmware_boundaries},
     {"firmware query failure is latched", test_firmware_query_failure},
+    {"idle button-service failure blocks mount and retries", test_idle_startup_failure},
     {"immediate mount invokes disk callbacks", test_mount},
     {"mount and nonzero volume failures are terminal", test_mount_failure},
     {"mount retains sector I/O failure", test_mount_io_failure},
@@ -1369,6 +1456,7 @@ TEST_LIST = {
     {"unsupported context is nonfatal and performs no I/O", test_unsupported_context},
     {"release unmounts before MCU FS INIT", test_release},
     {"release failures refuse handoff", test_release_refusals},
+    {"idle service stop failures refuse MCU filesystem reuse", test_release_idle_stop_faults},
     {NULL, NULL},
 };
 

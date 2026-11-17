@@ -17,7 +17,8 @@
 #error Build this ROM with tests/ed64_pro/Makefile.n64
 #endif
 
-#if (defined(ED64_PRO_TEST_INFO) + defined(ED64_PRO_TEST_STORAGE) + defined(ED64_PRO_TEST_LOAD)) > 1
+#if (defined(ED64_PRO_TEST_INFO) + defined(ED64_PRO_TEST_STORAGE) + defined(ED64_PRO_TEST_LOAD) + \
+     defined(ED64_PRO_TEST_BUTTON)) > 1
 #error Select one qualification mode
 #endif
 #if defined(ED64_PRO_TEST_LOAD_TIMING) && !defined(ED64_PRO_TEST_LOAD)
@@ -37,7 +38,8 @@
 #error Injected-write qualification requires ED64_PRO_TEST_FAIL_WRITE_N=1
 #endif
 
-#if !defined(ED64_PRO_TEST_STORAGE) && !defined(ED64_PRO_TEST_INFO) && !defined(ED64_PRO_TEST_LOAD)
+#if !defined(ED64_PRO_TEST_STORAGE) && !defined(ED64_PRO_TEST_INFO) && !defined(ED64_PRO_TEST_LOAD) && \
+    !defined(ED64_PRO_TEST_BUTTON)
 enum {
     STRESS_OPERATIONS = 100000,
     STRESS_TIMER_US = 50,
@@ -176,7 +178,57 @@ static void terminal (void) {
     }
 }
 
-#if !defined(ED64_PRO_TEST_STORAGE) && !defined(ED64_PRO_TEST_INFO) && !defined(ED64_PRO_TEST_LOAD)
+#ifdef ED64_PRO_TEST_BUTTON
+/** @brief Poll the physical cartridge button without mounting storage or polling USB. */
+static void run_button (void) {
+    flashcart_t *adapter = ed64_pro_get_flashcart();
+    flashcart_err_t result = adapter->init();
+    print_identity();
+    print_init_metrics();
+    if (result != FLASHCART_OK || !adapter->get_button_state) {
+        printf("\nButton init FAILED: %u\n%s\n", (unsigned)result, ed64_pro_get_error_message());
+        terminal();
+    }
+    flashcart_firmware_version_t firmware = adapter->get_firmware_version();
+    bool baseline = false, previous = false, passed = false;
+    uint32_t presses = 0, releases = 0, polls = 0;
+    for (;;) {
+        bool pressed;
+        result = adapter->get_button_state(&pressed);
+        if (result != FLASHCART_OK) {
+            printf("\nButton read FAILED: %u\n", (unsigned)result);
+            terminal();
+        }
+        polls++;
+        if (!baseline) {
+            baseline = !pressed;
+        } else if (pressed != previous) {
+            if (pressed) {
+                presses++;
+            } else {
+                releases++;
+            }
+        }
+        previous = pressed;
+        passed |= baseline && releases >= 3 && presses >= 3;
+        console_clear();
+        print_identity();
+        printf("\n%s\nFirmware: %u.%u.%" PRIu32 "\n", adapter->get_name(), firmware.major, firmware.minor,
+               firmware.revision);
+        printf("\nPhysical cartridge button: %s\n", pressed ? "Pressed" : "Released");
+        printf("Released baseline: %s\n", baseline ? "seen" : "release button first");
+        printf("Presses: %" PRIu32 "; releases: %" PRIu32 "\n", presses, releases);
+        printf("Successful polls: %" PRIu32 "\n", polls);
+        printf("\nPress/release the cartridge button 3 times.\n");
+        printf("%s\n", passed ? "PASS: 3 complete press/release cycles." : "Waiting for physical button cycles...");
+        printf("\nNo storage mount, file writes, or USB polling.\n");
+        console_render();
+    }
+}
+#endif
+
+#if !defined(ED64_PRO_TEST_STORAGE) && !defined(ED64_PRO_TEST_INFO) && !defined(ED64_PRO_TEST_LOAD) && \
+    !defined(ED64_PRO_TEST_BUTTON)
 /**
  * @brief Exercise 100,000 status/EDID operations under timer-driven cache-line contention.
  *
@@ -865,6 +917,9 @@ int main (void) {
     printf("Firmware: %u.%u.%" PRIu32 " (minimum 26.1014)\n", firmware.major, firmware.minor, firmware.revision);
     printf("Init result: %u\n%s\n", (unsigned)result, ed64_pro_get_error_message());
     terminal();
+#elif defined(ED64_PRO_TEST_BUTTON)
+    screen_init();
+    run_button();
 #elif defined(ED64_PRO_TEST_STORAGE)
     screen_init();
     run_storage();

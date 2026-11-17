@@ -42,6 +42,7 @@ enum {
     ED64_PRO_SD_TIMEOUT_MS = 5000,
     ED64_PRO_IO_TIMEOUT_MS = 5000,
     ED64_PRO_FLAG_WRSW = 0x01,
+    ED64_PRO_SYSSTAT_BTN = 1u << 16,
     ED64_PRO_PATH_MAX = 1023,
     ED64_PRO_FCI_ROM_LIMIT = 0x0F000000,
     ED64_PRO_FRAME_MAX = 1536,
@@ -285,5 +286,9 @@ ed64_pro_ll_dev_set_cfg (ed64_pro_ll_transaction_t *transaction, const ed64_pro_
  * @brief Start the configured device and validate its MCU status.
  */
 ed64_pro_ll_error_t ed64_pro_ll_dev_start (ed64_pro_ll_transaction_t *transaction, uint32_t deadline);
+/**
+ * @brief Start an all-disabled configuration and verify inactive handlers before mounting FatFs.
+ */
+ed64_pro_ll_error_t ed64_pro_ll_start_idle (ed64_pro_ll_transaction_t *transaction, uint32_t deadline);
 
 #endif

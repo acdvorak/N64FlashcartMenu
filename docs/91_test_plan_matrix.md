@@ -66,7 +66,7 @@ Before starting a full test cycle, document the current baseline status to track
 | **Controller Pak** | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **Auto CIC/Region Detection** | ✓ | Manual | ✓ | ✓ | ✓ |
 | **Fast Reboot** | ✓ | - | - | - | ✓ |
-| **Diagnostics** | - | - | - | … | ✓ |
+| **Diagnostics** | - | - | - | Button only | ✓ |
 
 **Notes:**
 - `…` = possible, but not yet implemented; `-` = unavailable.

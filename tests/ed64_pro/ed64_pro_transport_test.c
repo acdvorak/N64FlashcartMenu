@@ -108,6 +108,7 @@ static struct {
     uint32_t fci_address;
     uint16_t flags;
     unsigned flag_commands;
+    uint32_t sysstat_value;
     bool sysstat_busy;
     bool sysstat_unstable;
     unsigned sysstat_reads;
@@ -120,6 +121,15 @@ static struct {
     uint8_t config_bytes[64];
     unsigned config_commands;
     unsigned start_commands;
+    uint8_t idle_config_bytes[64];
+    unsigned idle_config_commands;
+    unsigned idle_start_commands;
+    bool idle_configured;
+    bool button_reporting;
+    uint8_t handlers[16];
+    size_t handlers_reply_limit;
+    bool handlers_trailing;
+    unsigned handler_requests;
     char dev_steps[16];
     size_t dev_step_count;
     bool wre;
@@ -435,19 +445,44 @@ static void execute_bus (void) {
             case 0x85:
                 if (mock.ram[4] == 0x20) {
                     TEST_ASSERT(bytes == 69);
+                    mock.idle_configured = true;
                     for (size_t i = 0; i < sizeof(mock.config_bytes); i++) {
-                        mock.config_bytes[i] = mock.ram[i + 5];
+                        mock.idle_configured &= mock.ram[i + 5] == 0;
                     }
-                    mock.config_commands++;
-                    TEST_ASSERT(mock.dev_step_count < sizeof(mock.dev_steps));
-                    mock.dev_steps[mock.dev_step_count++] = 'C';
+                    uint8_t *config = mock.idle_configured ? mock.idle_config_bytes : mock.config_bytes;
+                    for (size_t i = 0; i < sizeof(mock.config_bytes); i++) {
+                        config[i] = mock.ram[i + 5];
+                    }
+                    if (mock.idle_configured) {
+                        mock.idle_config_commands++;
+                    } else {
+                        mock.config_commands++;
+                        TEST_ASSERT(mock.dev_step_count < sizeof(mock.dev_steps));
+                        mock.dev_steps[mock.dev_step_count++] = 'C';
+                    }
                     break;
                 }
                 if (mock.ram[4] == 0x11) {
                     TEST_ASSERT(bytes == 5);
-                    mock.start_commands++;
-                    TEST_ASSERT(mock.dev_step_count < sizeof(mock.dev_steps));
-                    mock.dev_steps[mock.dev_step_count++] = 'S';
+                    mock.button_reporting = true;
+                    if (mock.idle_configured) {
+                        mock.idle_start_commands++;
+                    } else {
+                        mock.start_commands++;
+                        TEST_ASSERT(mock.dev_step_count < sizeof(mock.dev_steps));
+                        mock.dev_steps[mock.dev_step_count++] = 'S';
+                    }
+                    break;
+                }
+                if (mock.ram[4] == 0x27) {
+                    TEST_ASSERT(bytes == 5);
+                    mock.handler_requests++;
+                    for (size_t i = 0; i < mock.handlers_reply_limit; i++) {
+                        rx_push(mock.handlers[i]);
+                    }
+                    if (mock.handlers_trailing) {
+                        rx_push(0xEF);
+                    }
                     break;
                 }
                 if (mock.ram[4] == 0x28) {
@@ -464,6 +499,8 @@ static void execute_bus (void) {
                 }
                 TEST_ASSERT(mock.length == 20 && mock.ram[4] == 0x10);
                 mock.stop_commands++;
+                mock.button_reporting = false;
+                mock.idle_configured = false;
                 mock.ready_tick = mock.now + mock.stop_delay;
                 for (size_t i = 0; i < mock.post_stop_junk; i++) {
                     rx_push((uint8_t)(0x80 + i));
@@ -496,7 +533,10 @@ static void execute_bus (void) {
             mock.ram[0] = mock.fifo_upper | (mock.count_override ? mock.reported_count : mock.rx_count);
             break;
         case 0x1F800008u:
-            mock.ram[0] = mock.sysstat_busy ? 1 : 0;
+            mock.ram[0] = mock.sysstat_value | (mock.sysstat_busy ? 1u : 0u);
+            if (!mock.button_reporting) {
+                mock.ram[0] &= ~ED64_PRO_SYSSTAT_BTN;
+            }
             if (mock.sysstat_unstable && (mock.sysstat_reads & 1)) {
                 mock.ram[0] ^= 0x10;
             }
@@ -675,6 +715,8 @@ static void power_on (void) {
     mock.info_values[1] = 0x04000000u;
     mock.info_reply_limit = 8;
     mock.rtc_reply_limit = ED64_PRO_RTC_SIZE;
+    mock.handlers_reply_limit = sizeof(mock.handlers);
+    mock.button_reporting = true;
     const uint8_t rtc_bytes[] = {0x26, 0x11, 0x16, 0x12, 0x34, 0x56, 0x02, 0xA5};
     memcpy(mock.rtc_bytes, rtc_bytes, sizeof(rtc_bytes));
     mock.nresp_detail = 0xA3;
@@ -1726,7 +1768,7 @@ static void test_adapter_unavailable_operations (void) {
         TEST_CHECK(adapter->load_save("sd:/test.sra") == FLASHCART_ERR_ARGS);
         TEST_CHECK(adapter->set_save_type(FLASHCART_SAVE_TYPE_SRAM_256KBIT) == FLASHCART_ERR_LOAD);
         TEST_CHECK(adapter->deinit != NULL && adapter->load_64dd_ipl == NULL && adapter->load_64dd_disk == NULL);
-        TEST_CHECK(adapter->load_64dd_disks == NULL && adapter->get_button_state == NULL);
+        TEST_CHECK(adapter->load_64dd_disks == NULL && adapter->get_button_state != NULL);
         TEST_CHECK(adapter->get_voltage_temperature == NULL && adapter->set_save_writeback == NULL);
         TEST_CHECK(adapter->set_next_boot_mode == NULL && mock.accesses == accesses);
     }
@@ -1866,6 +1908,97 @@ static flashcart_t *rtc_mounted_fixture (void) {
     TEST_ASSERT(ed64_pro_init_sdfs("sd:/", 4));
     TEST_ASSERT(pro_diagnostics.storage_state == ED64_PRO_STORAGE_FATFS_OWNED);
     return adapter;
+}
+
+/**
+ * @brief Read fresh full-width button samples without FIFO commands or register writes.
+ */
+static void test_button_state (void) {
+    handoff_fixture();
+    flashcart_t *adapter = ed64_pro_get_flashcart();
+    TEST_ASSERT(adapter->init() == FLASHCART_OK && adapter->get_button_state != NULL);
+    TEST_ASSERT(pro_diagnostics.storage_state == ED64_PRO_STORAGE_MCU_OWNED);
+    static const struct {
+        uint32_t sysstat;
+        bool pressed;
+    } samples[] = {
+        {0x00000000u, false}, {0xFFFEFFFFu, false}, {0x00010000u, true},
+        {0xFFFFFFFFu, true}, {0x00000000u, false},
+    };
+    unsigned reads = mock.io_reads;
+    unsigned dma_reads = mock.dma_reads, dma_writes = mock.dma_writes, io_writes = mock.io_writes;
+    size_t tx_count = mock.tx_count, rx_consumed = mock.rx_consumed;
+    for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
+        mock.sysstat_value = samples[i].sysstat;
+        bool pressed = !samples[i].pressed;
+        size_t bus_count = mock.bus_count;
+        TEST_CHECK(adapter->get_button_state(&pressed) == FLASHCART_OK);
+        TEST_CHECK(pressed == samples[i].pressed);
+        TEST_CHECK(mock.bus_count == bus_count + 1 && mock.io_reads == reads + i + 1);
+        TEST_CHECK(mock.bus[bus_count].address == 0x1F800008u);
+        TEST_CHECK(mock.bus[bus_count].length == 4 && !mock.bus[bus_count].write);
+        TEST_CHECK(pro_ll.owner == NULL && pro_ll.failure.code == ED64_PRO_LL_OK);
+    }
+    TEST_CHECK(mock.dma_reads == dma_reads && mock.dma_writes == dma_writes && mock.io_writes == io_writes);
+    TEST_CHECK(mock.tx_count == tx_count && mock.rx_consumed == rx_consumed);
+}
+
+/**
+ * @brief Reject invalid outputs and unavailable adapters without publishing a button sample.
+ */
+static void test_button_unavailable (void) {
+    handoff_fixture();
+    flashcart_t *adapter = ed64_pro_get_flashcart();
+    TEST_ASSERT(adapter->init() == FLASHCART_OK && adapter->get_button_state != NULL);
+    unsigned accesses = mock.accesses;
+    TEST_CHECK(adapter->get_button_state(NULL) == FLASHCART_ERR_ARGS);
+    for (ed64_pro_state_t state = ED64_PRO_COLD; state <= ED64_PRO_FAILED; state++) {
+        if (state == ED64_PRO_READY) {
+            continue;
+        }
+        pro_diagnostics.state = state;
+        bool pressed = true;
+        TEST_CHECK(adapter->get_button_state(&pressed) == FLASHCART_ERR_INT && pressed);
+    }
+    pro_diagnostics.state = ED64_PRO_READY;
+    pro_diagnostics.storage_failed = true;
+    bool pressed = false;
+    TEST_CHECK(adapter->get_button_state(&pressed) == FLASHCART_ERR_INT && !pressed);
+    TEST_CHECK(mock.accesses == accesses && pro_ll.owner == NULL && pro_ll.failure.code == ED64_PRO_LL_OK);
+}
+
+/**
+ * @brief Preserve output and transaction ownership on contention, unsupported context, and read failure.
+ */
+static void test_button_transport_errors (void) {
+    handoff_fixture();
+    flashcart_t *adapter = ed64_pro_get_flashcart();
+    TEST_ASSERT(adapter->init() == FLASHCART_OK && adapter->get_button_state != NULL);
+    unsigned accesses = mock.accesses;
+    bool pressed = true;
+    ed64_pro_ll_transaction_t transaction;
+    begin(&transaction);
+    TEST_CHECK(adapter->get_button_state(&pressed) == FLASHCART_ERR_INT && pressed);
+    TEST_CHECK(pro_ll.owner == &transaction && mock.accesses == accesses);
+    end(&transaction);
+    mock.kernel = true;
+    TEST_CHECK(adapter->get_button_state(&pressed) == FLASHCART_ERR_INT && pressed);
+    mock.kernel = false;
+    disable_interrupts();
+    TEST_CHECK(adapter->get_button_state(&pressed) == FLASHCART_ERR_INT && pressed);
+    TEST_CHECK(mock.irq_depth == 1);
+    enable_interrupts();
+    TEST_CHECK(pro_ll.owner == NULL && mock.accesses == accesses && pro_ll.failure.code == ED64_PRO_LL_OK);
+
+    /* The register read expires after acquisition, so the callback must release ownership. */
+    mock.tick_step = TICKS_FROM_MS(ED64_PRO_IO_TIMEOUT_MS);
+    TEST_CHECK(adapter->get_button_state(&pressed) == FLASHCART_ERR_INT && pressed);
+    TEST_CHECK(pro_ll.owner == NULL && mock.accesses == accesses && pro_ll.failure.code == ED64_PRO_LL_TIMEOUT);
+    ed64_pro_ll_failure_t first = pro_ll.failure;
+    mock.tick_step = 1;
+    TEST_CHECK(adapter->get_button_state(&pressed) == FLASHCART_ERR_INT && pressed);
+    TEST_CHECK(pro_ll.owner == NULL && mock.accesses == accesses);
+    TEST_CHECK(memcmp(&first, &pro_ll.failure, sizeof(first)) == 0);
 }
 
 /**
@@ -2591,6 +2724,121 @@ static void test_dev_config_frame (void) {
 }
 
 /**
+ * @brief Start an exact all-disabled configuration and consume only the sixteen-byte handler reply.
+ */
+static void test_idle_configuration (void) {
+    power_on();
+    identify();
+    for (size_t i = 6; i < sizeof(mock.handlers); i++) {
+        mock.handlers[i] = (uint8_t)(0x80 + i);
+    }
+    memset(mock.idle_config_bytes, 0xCD, sizeof(mock.idle_config_bytes));
+    ed64_pro_ll_transaction_t transaction;
+    begin(&transaction);
+    TEST_CHECK(ed64_pro_ll_start_idle(&transaction, deadline_ms(15000)) == ED64_PRO_LL_OK);
+    const uint8_t header[] = {0x2B, 0xD4, 0x85, 0x7A, 0x20};
+    const uint8_t tail[] = {
+        0x2B, 0xD4, 0x10, 0xEF, 0x2B, 0xD4, 0x85, 0x7A, 0x11,
+        0x2B, 0xD4, 0x10, 0xEF, 0x2B, 0xD4, 0x85, 0x7A, 0x27,
+    };
+    TEST_CHECK(mock.tx_count == 87 && memcmp(mock.tx_bytes, header, sizeof(header)) == 0);
+    for (size_t i = 0; i < sizeof(mock.idle_config_bytes); i++) {
+        TEST_CHECK(mock.idle_config_bytes[i] == 0 && mock.tx_bytes[sizeof(header) + i] == 0);
+    }
+    TEST_CHECK(memcmp(mock.tx_bytes + 69, tail, sizeof(tail)) == 0);
+    TEST_CHECK(mock.idle_config_commands == 1 && mock.idle_start_commands == 1 && mock.handler_requests == 1);
+    TEST_CHECK(mock.config_commands == 0 && mock.start_commands == 0 && mock.dev_step_count == 0);
+    TEST_CHECK(mock.status_requests == 2 && mock.rx_consumed == 24 && mock.rx_count == 0);
+    TEST_CHECK(mock.path_commands == 0 && mock.wre_commands == 0 && mock.sd_commands == 0 && mock.io_writes == 0);
+    TEST_CHECK(pro_ll.failure.code == ED64_PRO_LL_OK && !pro_ll.status_valid);
+    end(&transaction);
+}
+
+/**
+ * @brief Refuse every active handler or dirty cache without retrying the idle-start sequence.
+ */
+static void test_idle_active_handlers (void) {
+    for (size_t active = 0; active < 6; active++) {
+        power_on();
+        identify();
+        mock.handlers[active] = (uint8_t)(active + 1);
+        ed64_pro_ll_transaction_t transaction;
+        begin(&transaction);
+        TEST_CHECK(ed64_pro_ll_start_idle(&transaction, deadline_ms(15000)) == ED64_PRO_LL_FRAME);
+        TEST_CHECK(mock.idle_config_commands == 1 && mock.idle_start_commands == 1 && mock.handler_requests == 1);
+        TEST_CHECK(mock.rx_count == 0 && pro_ll.failure.transferred == 16);
+        unsigned accesses = mock.accesses;
+        ed64_pro_ll_failure_t first = pro_ll.failure;
+        TEST_CHECK(ed64_pro_ll_start_idle(&transaction, deadline_ms(15000)) == ED64_PRO_LL_FRAME);
+        TEST_CHECK(mock.accesses == accesses && memcmp(&first, &pro_ll.failure, sizeof(first)) == 0);
+        end(&transaction);
+    }
+}
+
+/**
+ * @brief Keep checked configuration/start failures and malformed handler replies terminal.
+ */
+static void test_idle_faults (void) {
+    for (unsigned fault = 0; fault < 6; fault++) {
+        power_on();
+        identify();
+        mock.tick_step = TICKS_FROM_MS(1);
+        if (fault == 0) {
+            rx_push(0xEE);
+        } else if (fault == 1) {
+            mock.replies[0].bytes[3] = 0xB0;
+        } else if (fault == 2) {
+            mock.replies[1].bytes[0] = 0xEE;
+        } else if (fault == 3 || fault == 4) {
+            mock.handlers_reply_limit = fault == 3 ? 0 : 15;
+        } else {
+            mock.handlers_trailing = true;
+        }
+        ed64_pro_ll_transaction_t transaction;
+        uint32_t deadline = deadline_ms(100);
+        TEST_ASSERT(ed64_pro_ll_begin(&transaction, deadline) == ED64_PRO_LL_OK);
+        ed64_pro_ll_error_t expected = fault == 1 ? ED64_PRO_LL_MCU_ERROR :
+            fault == 2 ? ED64_PRO_LL_FRAME : fault == 3 || fault == 4 ? ED64_PRO_LL_TIMEOUT :
+            ED64_PRO_LL_TRAILING_DATA;
+        TEST_CHECK(ed64_pro_ll_start_idle(&transaction, deadline_ms(15000)) == expected);
+        TEST_CHECK(mock.idle_config_commands == (fault == 0 ? 0u : 1u));
+        TEST_CHECK(mock.idle_start_commands == (fault <= 1 ? 0u : 1u));
+        TEST_CHECK(mock.handler_requests == (fault <= 2 ? 0u : 1u));
+        TEST_CHECK(mock.status_requests == (fault == 0 ? 0u : fault == 1 ? 1u : 2u));
+        TEST_CHECK((int32_t)(mock.now - deadline) < (int32_t)TICKS_FROM_MS(10));
+        unsigned accesses = mock.accesses;
+        ed64_pro_ll_failure_t first = pro_ll.failure;
+        TEST_CHECK(ed64_pro_ll_start_idle(&transaction, deadline_ms(15000)) == expected);
+        TEST_CHECK(mock.accesses == accesses && memcmp(&first, &pro_ll.failure, sizeof(first)) == 0);
+        end(&transaction);
+    }
+}
+
+/**
+ * @brief Model the hardware requirement that STOP disables button reporting and idle START restores it.
+ */
+static void test_idle_restores_button (void) {
+    power_on();
+    identify();
+    mock.sysstat_value = ED64_PRO_SYSSTAT_BTN;
+    ed64_pro_ll_transaction_t transaction;
+    begin(&transaction);
+    uint32_t value;
+    TEST_CHECK(ed64_pro_ll_read_reg(&transaction, ED64_PRO_REG_SYSSTAT, &value, deadline_ms(1000)) == ED64_PRO_LL_OK);
+    TEST_CHECK((value & ED64_PRO_SYSSTAT_BTN) != 0);
+    TEST_CHECK(ed64_pro_ll_stop(&transaction, deadline_ms(5000)) == ED64_PRO_LL_OK);
+    TEST_CHECK(ed64_pro_ll_read_reg(&transaction, ED64_PRO_REG_SYSSTAT, &value, deadline_ms(1000)) == ED64_PRO_LL_OK);
+    TEST_CHECK((value & ED64_PRO_SYSSTAT_BTN) == 0);
+    TEST_CHECK(ed64_pro_ll_start_idle(&transaction, deadline_ms(15000)) == ED64_PRO_LL_OK);
+    TEST_CHECK(ed64_pro_ll_read_reg(&transaction, ED64_PRO_REG_SYSSTAT, &value, deadline_ms(1000)) == ED64_PRO_LL_OK);
+    TEST_CHECK((value & ED64_PRO_SYSSTAT_BTN) != 0);
+    TEST_CHECK(ed64_pro_ll_stop(&transaction, deadline_ms(5000)) == ED64_PRO_LL_OK);
+    TEST_CHECK(ed64_pro_ll_read_reg(&transaction, ED64_PRO_REG_SYSSTAT, &value, deadline_ms(1000)) == ED64_PRO_LL_OK);
+    TEST_CHECK((value & ED64_PRO_SYSSTAT_BTN) == 0);
+    end(&transaction);
+}
+
+/**
  * @brief Verify launch command order and stop at the first failed step.
  */
 static void test_dev_order_and_faults (void) {
@@ -2662,6 +2910,13 @@ static void test_sd_injected_write_failure (void) {
 #endif
 
 TEST_LIST = {
+    {"Idle start sends disabled config and checks direct handler reply", test_idle_configuration},
+    {"Idle start refuses active handlers or dirty caches", test_idle_active_handlers},
+    {"Idle start faults remain terminal and preserve whole deadline", test_idle_faults},
+    {"Idle start restores button reporting disabled by STOP", test_idle_restores_button},
+    {"Pro button reads fresh full-width SYSSTAT samples", test_button_state},
+    {"Pro button rejects unavailable adapters without I/O", test_button_unavailable},
+    {"Pro button preserves output and ownership on transport errors", test_button_transport_errors},
     {"RTC adapter uses hardware then cache and unhooks on deinit", test_rtc_adapter_cache},
     {"RTC adapter confirms writes and refuses ignored SET", test_rtc_adapter_set},
     {"RTC adapter can repair an invalid hardware date", test_rtc_adapter_invalid_date},

@@ -201,6 +201,7 @@ const char *ed64_pro_phase_name (ed64_pro_phase_t phase) {
     case ED64_PRO_PHASE_SD_INIT: return "SD readiness";
     case ED64_PRO_PHASE_READY: return "Transport ready";
     case ED64_PRO_PHASE_FIRMWARE_INFO: return "Firmware info";
+    case ED64_PRO_PHASE_IDLE_START: return "Idle button services";
     default: return "Unknown phase";
     }
 }
@@ -387,6 +388,23 @@ static flashcart_err_t pro_init (void) {
         pro_diagnostics.info_result =
             version.major < 26 || (version.major == 26 && version.minor < 1014) ? FLASHCART_ERR_OUTDATED : FLASHCART_OK;
         if (pro_diagnostics.info_result == FLASHCART_OK) {
+            /* STOP also disables button reporting. Restart with every save,
+             * RTC and DD handler disabled before FatFs takes SD ownership. */
+            pro_set_phase(ED64_PRO_PHASE_IDLE_START);
+            deadline = TICKS_READ() + 3u * TICKS_FROM_MS(ED64_PRO_IO_TIMEOUT_MS);
+            error = ed64_pro_ll_begin(&transaction, deadline);
+            if (error == ED64_PRO_LL_OK) {
+                error = ed64_pro_ll_start_idle(&transaction, deadline);
+                ed64_pro_ll_error_t end_error = ed64_pro_ll_end(&transaction);
+                if (error == ED64_PRO_LL_OK) {
+                    error = end_error;
+                }
+            }
+            if (error != ED64_PRO_LL_OK) {
+                pro_diagnostics.info_result = FLASHCART_ERR_INT;
+                pro_init_fail(error);
+                return FLASHCART_ERR_INT;
+            }
             pro_diagnostics.storage_state = ED64_PRO_STORAGE_MCU_OWNED;
             pro_diagnostics.volume_id = -1;
         }
@@ -409,6 +427,32 @@ static bool pro_has_feature (flashcart_features_t feature) {
 /** @brief Return cached information without MCU traffic. */
 static flashcart_firmware_version_t pro_get_firmware_version (void) {
     return pro_diagnostics.firmware_version;
+}
+
+/** @brief Read the physical cartridge button without MCU commands or storage access. */
+static flashcart_err_t pro_get_button_state (bool *pressed) {
+    if (!pressed) {
+        return FLASHCART_ERR_ARGS;
+    }
+    if (pro_diagnostics.state != ED64_PRO_READY || pro_diagnostics.storage_failed) {
+        return FLASHCART_ERR_INT;
+    }
+    uint32_t value;
+    uint32_t deadline = TICKS_READ() + TICKS_FROM_MS(ED64_PRO_IO_TIMEOUT_MS);
+    ed64_pro_ll_transaction_t transaction;
+    ed64_pro_ll_error_t error = ed64_pro_ll_begin(&transaction, deadline);
+    if (error == ED64_PRO_LL_OK) {
+        error = ed64_pro_ll_read_reg(&transaction, ED64_PRO_REG_SYSSTAT, &value, deadline);
+        ed64_pro_ll_error_t end_error = ed64_pro_ll_end(&transaction);
+        if (error == ED64_PRO_LL_OK) {
+            error = end_error;
+        }
+    }
+    if (error != ED64_PRO_LL_OK) {
+        return FLASHCART_ERR_INT;
+    }
+    *pressed = (value & ED64_PRO_SYSSTAT_BTN) != 0;
+    return FLASHCART_OK;
 }
 
 /** @brief Report whether FatFs owns a ready, healthy SD transport. */
@@ -582,19 +626,41 @@ static flashcart_err_t pro_release_storage (void) {
     }
     pro_diagnostics.volume_id = -1;
     pro_diagnostics.storage_state = ED64_PRO_STORAGE_RELEASING;
-    uint32_t deadline = TICKS_READ() + TICKS_FROM_MS(ED64_PRO_IO_TIMEOUT_MS);
+    uint32_t deadline = TICKS_READ() + TICKS_FROM_MS(
+        ED64_PRO_STOP_TIMEOUT_MS + ED64_PRO_DRAIN_TIMEOUT_MS + ED64_PRO_STATUS_TIMEOUT_MS + ED64_PRO_IO_TIMEOUT_MS
+    );
+    const char *operation = "Idle STOP";
+    pro_diagnostics.status_valid = false;
     ed64_pro_ll_transaction_t transaction;
     ed64_pro_ll_error_t error = ed64_pro_ll_begin(&transaction, deadline);
     if (error == ED64_PRO_LL_OK) {
-        error = ed64_pro_ll_init_sd(&transaction, &pro_diagnostics.status, deadline);
-        pro_diagnostics.status_valid = error == ED64_PRO_LL_OK || error == ED64_PRO_LL_MCU_ERROR;
+        /* FatFs is already unmounted. Stop idle polling before restoring MCU
+         * filesystem ownership or staging the next game's configuration. */
+        error = ed64_pro_ll_stop(&transaction, deadline);
+        if (error == ED64_PRO_LL_OK) {
+            size_t drained;
+            error = ed64_pro_ll_drain(&transaction, &drained, deadline);
+        }
+        if (error == ED64_PRO_LL_OK) {
+            error = ed64_pro_ll_check_status(
+                &transaction, &pro_diagnostics.status,
+                ed64_pro_ll_limit_deadline(deadline, ED64_PRO_STATUS_TIMEOUT_MS)
+            );
+            pro_diagnostics.status_valid = error == ED64_PRO_LL_OK || error == ED64_PRO_LL_MCU_ERROR;
+        }
+        if (error == ED64_PRO_LL_OK) {
+            operation = "FS INIT";
+            pro_diagnostics.status_valid = false;
+            error = ed64_pro_ll_init_sd(&transaction, &pro_diagnostics.status, deadline);
+            pro_diagnostics.status_valid = error == ED64_PRO_LL_OK || error == ED64_PRO_LL_MCU_ERROR;
+        }
         ed64_pro_ll_error_t end_error = ed64_pro_ll_end(&transaction);
         if (error == ED64_PRO_LL_OK) {
             error = end_error;
         }
     }
     if (error != ED64_PRO_LL_OK) {
-        pro_storage_fail("MCU filesystem reinitialization failed", "FS INIT", 0, 0, error);
+        pro_storage_fail("MCU storage handoff failed", operation, 0, 0, error);
         return FLASHCART_ERR_INT;
     }
     pro_diagnostics.storage_state = ED64_PRO_STORAGE_MCU_OWNED;
@@ -1061,7 +1127,7 @@ static flashcart_t flashcart_ed64_pro = {
     .load_64dd_ipl = NULL,
     .load_64dd_disk = NULL,
     .load_64dd_disks = NULL,
-    .get_button_state = NULL,
+    .get_button_state = pro_get_button_state,
     .get_voltage_temperature = NULL,
     .set_save_type = pro_set_save_type,
     .set_save_writeback = NULL,
